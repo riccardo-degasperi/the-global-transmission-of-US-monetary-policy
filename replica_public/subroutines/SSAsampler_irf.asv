@@ -1,0 +1,1034 @@
+function out = SSAsampler_irf(data,dims,hp,modelOpt,dataOpt,miscOpt,plotOpt,ssaOpt,chartName0)
+% Structural Scenario Analysis (in-sample)
+
+% INPUT:
+% - data     : output from makeXY;
+% - dims     : output from makeXY;
+% - hp       : hyperparameters and related options;
+% - modelOpt : structure containing model options;
+% - dataOpt  : structure containing data options; 
+% - miscOpt  : structure containing misc options;
+% - plotOpt  : structure containing plot options;
+% - ssaOpt   : structure containing SSA options;
+
+% OUTPUT:
+% - out      : structure containing estimation results and IRFs;
+
+% riccardo.degasperi@bancaditalia.it
+%-------------------------------------------------------------------------%
+
+% Additional options:
+plotIndividualChannels = 1; %plot conditional IRFs with bands
+plotHorizon            = 1; %choose horizon for shock distribution chart
+
+%-------------------------------------------------------------------------%
+% Unpacking
+X               = data.X;
+Y               = data.Y;
+endo            = data.endo;
+Xex             = data.Xex;
+T               = dims.T;
+N               = dims.N;
+p               = dims.p;
+pexo            = dims.pexo;
+m               = dims.m;
+mc              = dims.mc;
+h               = dims.h;
+dropExplosive   = miscOpt.dropExplosive;
+caseTriangular  = miscOpt.caseTriangular;
+shutVar         = modelOpt.shutVar;
+shutEq          = modelOpt.shutEq;
+sim             = modelOpt.sim;
+burnin          = modelOpt.burnin;
+jump            = modelOpt.jump;
+identification  = modelOpt.identification;
+draws           = (sim-burnin)/jump;
+GLP             = hp.GLP;
+plotOpt.ylab    = dataOpt.ylab;
+ylab0           = dataOpt.ylab;
+shockVar        = dataOpt.shockVar;
+shockSize       = dataOpt.shockSize;
+varplot         = dataOpt.varplot;
+varendo         = dataOpt.varendo;
+varendolong     = dataOpt.varendolong;
+units           = dataOpt.units;
+whichPlot       = plotOpt.whichPlot;
+KLtresh         = ssaOpt.KLtresh;
+impulse         = ssaOpt.impulse;
+iImpulse        = strcmp(varendo,impulse);
+
+% Patch for chartNames when units are more than 1
+if numel(units) > 1
+    units0 = join(string(units),'_');
+else
+    units0 = units;
+end
+
+% Check whether the shock is normalised or one SD
+check1sd = strcmp('1sd',shockSize);
+
+%-------------------------------------------------------------------------%
+% Upload SSA restrictions
+SSArest = feval(ssaOpt.SSAscript,impulse,dims,dataOpt,ssaOpt);
+
+%-------------------------------------------------------------------------%
+% Estimate univariate AR(order) for each endogenous variable
+hp.SS  = NaN(N,1);         %container for residual standard deviations
+hp.SS2 = NaN(N,1);         %container for residual variances
+order  = 1;                %we fit an AR(order) for the whole sample T
+
+for i = 1:N
+
+    % Build X and Y matrices
+    X2  = [ones(T-order,1) lagX(endo(:,i),order)]; % (T-p)x(p+1) matrix (with constant)
+    Y2  = endo(order+1:end,i);                     % (T-p)x1 matrix
+    
+    % Intermediate step
+    XX2 = X2'*X2;
+    XY2 = X2'*Y2;
+
+    % Compute beta and std of residuals
+    b2         = XX2\XY2;
+    hp.e2(:,i) = Y2-X2*b2;
+    hp.SS(i)   = std(Y2-X2*b2);
+    hp.SS2(i)  = hp.SS(i).^2;
+end
+
+% Compute mean across first p observations for endogenous
+Ybar = mean(endo(1:p,:),1)';
+
+% Compute mean across first p observations for exogenous
+if ~isempty(Xex)
+    Xbar = mean(Xex(1:p-pexo,:),1);
+else
+    Xbar = [];
+end
+
+%-------------------------------------------------------------------------%
+if modelOpt.dummies
+
+    
+    % Optimal priors
+    hpVAR = hp;   %initialise hpVAR
+    
+    if GLP
+    %disp('--> Computing optimal priors...')
+        
+        [hpglp,csmin,postMode] = GLPoptimalPriors(Y,X,Ybar,Xbar,hp,dims);
+    
+        % Update hyperparameters
+        f     = fieldnames(hpglp);
+        for i = 1:length(f)
+            hpVAR.(f{i}) = hpglp.(f{i});
+        end
+    
+    end
+    
+    % Generate dummy observations
+    [Yd,Xd] = dummyObs(Ybar,Xbar,hpVAR,dims);
+    
+    % Combined X and Y matrices
+    Yd = [Y; Yd];
+    Xd = [X; Xd];
+    
+    % Estimate reduced-form VAR
+    beta0    = Xd\Yd;
+    e0      = Yd-Xd*beta0;            %including dummies
+    [TT,NN] = size(Xd);
+    d       = N+2;
+    sigma0   = (e0'*e0)/(TT-NN+d+1);  %same Dof correction as GLP
+    
+    %---------------------------------------------------------------------%
+    % Sampler
+    
+    % Initialise containers
+    betas     = nan(N*p+m+mc,N,draws);
+    sigmas    = nan(N,N,draws);
+    es        = nan(T-p,N,draws);
+    y_cf      = nan(h+1,N,draws);
+    y_bl      = nan(h+1,N,draws);
+    B0nnr     = nan(N,N,draws);
+    B0        = nan(N,N,draws);
+    shock     = nan(T-p,numel(shockVar),draws);
+    SSAshocks = nan(h+1,N,draws);
+    KLc       = nan(draws,1);
+    maxeig    = nan(sim,1);
+    neig      = 0;
+    
+    k = 1;                                          %initialise index for storage matrices
+    s = 1;                                          %initialise count
+    w = 1;                                          %initialise count
+    
+    CinvS  = chol(inv((TT-NN+d+1)*nspd(sigma0)));   %removing DoF correction from sigma
+    CinvXX = chol(inv(Xd'*Xd));
+    
+    while k <= draws
+
+        % Display advancement
+        if k == 10*w
+            if exist('txt','var')
+                fprintf(repmat('\b', 1, numel(txt)));
+            end
+            disp(' ')
+            txt = ['    Draws satisfying KL condition: ',num2str(k),'/',num2str(s),' (of ',num2str(draws),' required) [',datestr(datetime),']\n'];
+            fprintf(txt);
+            w = w+1;
+        end
+    
+        %Get Psi
+        Xg = randn(TT+2-(N*p+m+mc),N)*CinvS;        % vec(Xg) ~ N(vec(0),kron(inv(TT*sigma),I))
+        sigma = inv(Xg'*Xg);                        % (Xg'Xg) ~ W(inv(TT*sigma),TT+2-(N*p+1))
+        % NOTE: Dof same as Banbura, Giannone & Reichlin (2010).
+        %       TT+2-(N*p+m) = T+N+2 (= df in GLP)
+        
+        if mod(s,jump) == 0 && s > burnin 
+        sigmas(:,:,k) = sigma;                      %store only after jump
+        end
+        
+        %Get Cholesky factor to use in MN below
+        Csigmas = chol(sigma);
+    
+        %Draw from posterior of beta (matrixvariate)
+        tmp  = randn(size(beta0));
+        beta = beta0 + CinvXX'*tmp*Csigmas;         % vec(betag) ~ N(vec(beta),kron(Sg,invXX))
+        
+        % Check maximum eigenvalue
+        A = NaN(N*p);                               %create companion matrix
+        A(1:N,:) = beta(1:end-m-mc,:)';
+        A(N+1:end,:) = [eye(N*(p-1)) zeros(N*(p-1),N)];
+        maxeig(s,1) = max(abs(eig(A)));             %compute maximum eigenvalue
+        if maxeig(s,1) > 1
+            neig = neig+1;
+        end
+    
+        % Get residuals
+        eps = Y - X*beta;
+    
+        % Burnin phase
+        if s <= burnin
+            s = s+1;
+        
+        % If we keep explosive draws
+        elseif ~dropExplosive && s > burnin
+            
+            if mod(s,jump) == 0
+    
+                % Estimate impact matrix
+                in.betas  = beta;
+                in.sigmas = sigma;
+                in.es     = eps;
+                [B0nnr_,IDX,flag] = SSAidentification(in,data,dims,modelOpt,dataOpt);
+
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+        
+                    % Transform to compact forecast notation
+                    [b,M] = compactForecastNotation(B0nnr_,beta,data,dims);
+                    
+                    % Draw Y | B,S,Q
+                    SSA = DrawConditionalForecast_irf(b,M,SSArest,iImpulse,dims);
+            
+                    if SSA.KLc <= KLtresh
+            
+                        y_cf(:,:,k)      = SSA.y_cf;
+                        y_bl(:,:,k)      = SSA.y_bl;
+                        SSAshocks(:,:,k) = SSA.shocks;
+                        KLc(k,1)         = SSA.KLc;
+                        B0nnr(:,:,k)     = IDX.B0nnr;
+                        B0(:,:,k)        = IDX.B0;
+                        shock(:,:,k)     = IDX.shock;
+                        betas(:,:,k)     = beta;               %VAR coefficients
+                        es(:,:,k)        = Y - X*beta;         %residuals for structural identification
+        
+                        k = k+1;                               %update index for storage matrices
+                    end
+                end
+            end
+            
+            s = s+1;
+    
+        % If we discard explosive draws
+        elseif dropExplosive && s > burnin && maxeig(s,1) < 1
+        
+            if mod(s,jump) == 0
+    
+                % Estimate impact matrix
+                in.betas  = beta;
+                in.sigmas = sigma;
+                in.es     = eps;
+                [B0nnr_,IDX,flag] = SSAidentification(in,data,dims,modelOpt,dataOpt);
+        
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    % Transform to compact forecast notation
+                    [b,M] = compactForecastNotation(B0nnr_,beta,data,dims);
+                    
+                    % Draw Y | B,S,Q
+                    SSA = DrawConditionalForecast_irf(b,M,SSArest,iImpulse,dims);
+            
+                    if SSA.KLc <= KLtresh
+            
+                        y_cf(:,:,k)      = SSA.y_cf;
+                        y_bl(:,:,k)      = SSA.y_bl;
+                        SSAshocks(:,:,k) = SSA.shocks;
+                        KLc(k,1)         = SSA.KLc;
+                        B0nnr(:,:,k)     = IDX.B0nnr;
+                        B0(:,:,k)        = IDX.B0;
+                        shock(:,:,k)     = IDX.shock;
+                        betas(:,:,k)     = beta;               %VAR coefficients
+                        es(:,:,k)        = Y - X*beta;         %residuals for structural identification
+        
+                        k = k+1;                               %update index for storage matrices
+                    end
+                end
+            end
+            
+            s = s+1;
+            
+        end
+    end
+    
+    % Display number of explosive draws
+    if ~dropExplosive
+    disp(['    Number of explosive draws: ' num2str(neig)])
+    end
+    disp(' ')
+
+
+%-------------------------------------------------------------------------%
+elseif modelOpt.triangular
+
+    % Patch: reorder equations moving shutEq on top
+    % NOTE: this is necessary to cast priors that are not block-diagonal.
+    
+    %Find location of equations to shut
+    lEq1 = ismember(varendo,shutEq);               %for reordering
+    lEq2 = false(1,N);  lEq2(1:sum(lEq1)) = true;  %to go back to previous order
+    
+    %Reorder X and Y
+    Y = [Y(:,lEq1) Y(:,~lEq1)];
+    
+    for i = 1:p
+        X_tmp = X(:,(i-1)*N+1:i*N);
+        X(:,(i-1)*N+1:i*N) = [X_tmp(:,lEq1) X_tmp(:,~lEq1)];
+    end
+    
+    % Reorder position of coefficients to shrink
+    lCoef = ismember(varendo,shutVar);
+    lCoef = [lCoef(lEq1) lCoef(~lEq1)];
+
+    % Initialise hpVAR
+    hpVAR = hp;
+    
+    % Reorder other relevant items
+    hpVAR.iRW = [hpVAR.iRW(lEq1);hpVAR.iRW(~lEq1)];
+    hpVAR.SS  = [hpVAR.SS(lEq1);hpVAR.SS(~lEq1)];
+    hpVAR.SS2 = [hpVAR.SS2(lEq1);hpVAR.SS2(~lEq1)];
+    hpVAR.e2  = [hpVAR.e2(:,lEq1) hpVAR.e2(:,~lEq1)];
+    
+    % Update positions for casting dogmatic prior
+    hpVAR.iParam = find(lCoef);                         %variables to shrink to zero
+    hpVAR.iEq    = 1:sum(lEq1);                         %equations to shrink
+
+
+    %---------------------------------------------------------------------%
+    % Generate prior mean and variance for beta
+    
+    if strcmp(caseTriangular,'CCM') || strcmp(caseTriangular,'SW') || strcmp(caseTriangular,'SV')
+    
+        % Generate prior hyperparameters
+        Pi_pm = zeros(N*(N*p),1);
+        Pi_pv = eye(N*(N*p));
+        co    = 0;
+        for i = 1:N
+            sigma_const(i) = hpVAR.SS2(i)*(hpVAR.l1*hpVAR.l5)^2;  % this sets the prior variance on the intercept 
+            for l = 1:p
+                for j = 1:N
+                    co = co+1;
+                    if i == j
+                        Pi_pv(co,co) = (hpVAR.l1/(l^hpVAR.l2))^2; % prior variance, own lags
+                        if l == 1
+                            if hpVAR.iRW(i) == 1
+                                Pi_pm(co) = 1;
+                            else
+                                Pi_pm(co) = 0;  
+                            end
+                        end % this sets the prior means for the first own lag coefficients.
+                    else
+                        if ismember(i,hpVAR.iEq) && ismember(j,hpVAR.iParam)
+                            Pi_pv(co,co) = hpVAR.eps;
+                        else
+                            Pi_pv(co,co) = (hpVAR.SS2(i)/hpVAR.SS2(j)*(hpVAR.l1*hpVAR.l6/(l^hpVAR.l2))^2); % prior variance, cross-lags
+                        end
+                    end
+                end
+            end
+        end
+    
+        % Beta~N(vec(b),omega)
+        tmp   = [reshape(diag(Pi_pv),N*p,N);repmat(sigma_const,m,1)]; %CHANGE
+        %tmp   = [repmat(sigma_const,m,1);reshape(diag(Pi_pv),N*p,N)];
+        omega = diag(tmp(:));                        % prior variance of Pai 
+        bb     = [reshape(Pi_pm,N*p,N);zeros(m,N)];   % prior mean of Pai  %CHANGE
+        %b     = [zeros(m,N);reshape(Pi_pm,N*p,N)];   % prior mean of Pai 
+    
+        % Inverses of prior matrices
+        iV         = diag(1./diag(omega));
+        iVb_prior  = iV*bb(:);                        
+    
+    end
+
+
+    %---------------------------------------------------------------------%
+    % EQUATION-BY-EQUATION HOMOSCEDASTIC Chan
+    if strcmp(caseTriangular,'Chan') 
+    
+    % Optimal priors
+    if GLP
+    [ml_opt,hpVAR] = get_OptKappa_mod(Y,X,p,m,hpVAR);
+    end
+
+    sim0 = 1;         %one draw at the time
+    
+    % Containers
+    Beta = zeros(sim0,N*(N*p+m));
+    Alp  = zeros(sim0,N*(N-1)/2);
+    Sig  = zeros(sim0,N);
+
+    betas     = nan(N*p+m,N,draws);
+    sigmas    = nan(N,N,draws);
+    es        = nan(T-p,N,draws);
+    y_cf      = nan(h+1,N,draws);
+    y_bl      = nan(h+1,N,draws);
+    B0nnr     = nan(N,N,draws);
+    B0        = nan(N,N,draws);
+    shock     = nan(T-p,numel(shockVar),draws);
+    SSAshocks = nan(h+1,N,draws);
+    KLc       = nan(draws,1);
+    maxeig    = nan(sim,1);
+    neig      = 0;
+
+    k = 1;                                          %initialise index for storage matrices
+    s = 1;                                          %initialise count
+    w = 1;                                          %initialise count
+    while k <= draws
+
+        % Display advancement
+        if k == 10*w
+            if exist('txt','var')
+                fprintf(repmat('\b', 1, numel(txt)));
+            end
+            disp(' ')
+            txt = ['    Draws satisfying KL condition: ',num2str(k),'/',num2str(s),' (of ',num2str(draws),' required) [',datestr(datetime),']\n'];
+            fprintf(txt);
+            w = w+1;
+        end
+    
+        % Equation-by-equation
+        count_alp = 0;
+        for ii = 1:N
+            
+            yi = Y(:,ii);
+            ki = N*p+ii +m-1;
+            
+            [mi,Vi,nui,Si,~] = prior_ACPi_mod(N,p,m,ii,hpVAR);
+            Xi = [X -Y(:,1:ii-1)];                                                      %adding -Y to the regressors (we are in structural form)
+            
+            % compute the parameters of the posterior distribution
+            iVi = Vi\speye(ki);
+            Kthetai = iVi + Xi'*Xi;
+            CKthetai = chol(Kthetai,'lower');    
+            thetai_hat = (CKthetai')\(CKthetai\(iVi*mi + Xi'*yi));                      %sigma is not there in Xi'yi because Sigma = eye(N) in structural form
+            Si_hat = Si + (yi'*yi + mi'*iVi*mi - thetai_hat'*Kthetai*thetai_hat)/2;
+            
+            % sample sig and theta
+            Sigi = 1./gamrnd(nui+(T-p)/2,1./Si_hat,sim0,1);
+            U = randn(sim0,ki).*repmat(sqrt(Sigi),1,ki);
+            Thetai = repmat(thetai_hat',sim0,1) + U/CKthetai;
+            
+            Sig(:,ii) = Sigi;
+            Beta(:,(ii-1)*(N*p+m)+1:ii*(N*p+m)) =  Thetai(:,1:N*p+m);
+            Alp(:,count_alp+1:count_alp+ii-1) =  Thetai(:,N*p+m+1:end);                  %estimates of the free elements in A
+            count_alp = count_alp + ii -1;
+        end
+
+        store_alp  = Alp;
+        store_beta = Beta;
+        store_Sig  = Sig;
+        
+        [store_Btilde,store_Sigtilde] = getReducedForm(store_alp,store_beta,store_Sig);
+        
+        beta_tmp = permute(store_Btilde,[2,1]);
+        beta = reshape(beta_tmp,N*p+m,N);
+        sigma = permute(store_Sigtilde,[2,3,1]);
+        eps = Y - X*beta;
+
+        % Check maximum eigenvalue
+        A = NaN(N*p);                               %create companion matrix
+        A(1:N,:) = beta(1:end-m,:)';
+        A(N+1:end,:) = [eye(N*(p-1)) zeros(N*(p-1),N)];
+        maxeig(s,1) = max(abs(eig(A)));             %compute maximum eigenvalue
+        if maxeig(s,1) > 1
+            neig = neig+1;
+        end
+
+        % Burnin phase
+        if s <= burnin
+            s = s+1;
+        
+        % If we keep explosive draws
+        elseif ~dropExplosive && s > burnin
+            
+            if mod(s,jump) == 0
+    
+                %---------------------------------------------------------%
+                % Patch: reorder equations
+                
+                % Reorder betas
+                beta_tmp3 = [];
+                for i = 1:p
+                    beta_tmp2 = NaN(N,N);
+                    beta_tmp1 = beta((i-1)*N+1:i*N,:);
+                    beta_tmp2(lEq1,:) = beta_tmp1(lEq2,:);
+                    beta_tmp2(~lEq1,:) = beta_tmp1(~lEq2,:);
+                    beta_tmp3 = [beta_tmp3;beta_tmp2];
+                end
+                beta_tmp3 = [beta_tmp3;beta(N*p+1:N*p+m,:)];
+                
+                beta0 = NaN(size(beta));
+                beta0(:,lEq1) = beta_tmp3(:,lEq2);
+                beta0(:,~lEq1) = beta_tmp3(:,~lEq2);
+                
+                % Reorder residuals
+                eps_tmp = NaN(size(eps));
+                eps_tmp(:,lEq1) = eps(:,lEq2);
+                eps_tmp(:,~lEq1) = eps(:,~lEq2);
+                eps0 = eps_tmp;
+
+                % Reorder sigmas
+                sigma0 = nan(size(sigma));
+                sigma0(lEq1,lEq1) = sigma(lEq2,lEq2);
+                sigma0(~lEq1,~lEq1) = sigma(~lEq2,~lEq2);
+                sigma0(lEq1,~lEq1) = sigma(lEq2,~lEq2);
+                sigma0(~lEq1,lEq1) = sigma(~lEq2,lEq2);
+
+                % Pack
+                in.betas  = beta0;
+                in.sigmas = sigma0;
+                in.es     = eps0;
+
+
+                %---------------------------------------------------------%
+                % Estimate impact matrix
+                [B0nnr_,IDX,flag] = SSAidentification(in,data,dims,modelOpt,dataOpt);
+        
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    % Transform to compact forecast notation
+                    [b,M] = compactForecastNotation(B0nnr_,beta0,data,dims);
+                    
+                    % Draw Y | B,S,Q
+                    SSA = DrawConditionalForecast_irf(b,M,SSArest,iImpulse,dims);
+            
+                    if SSA.KLc <= KLtresh
+            
+                        y_cf(:,:,k)      = SSA.y_cf;
+                        y_bl(:,:,k)      = SSA.y_bl;
+                        SSAshocks(:,:,k) = SSA.shocks;
+                        KLc(k,1)         = SSA.KLc;
+                        B0nnr(:,:,k)     = IDX.B0nnr;
+                        B0(:,:,k)        = IDX.B0;
+                        shock(:,:,k)     = IDX.shock;
+                        betas(:,:,k)     = beta0;              %VAR coefficients
+                        sigmas(:,:,k)    = sigma0;
+                        es(:,:,k)        = eps0;               %residuals for structural identification
+        
+                        k = k+1;                               %update index for storage matrices
+                    end
+                end
+            end
+            
+            s = s+1;
+    
+        % If we discard explosive draws
+        elseif dropExplosive && s > burnin && maxeig(s,1) < 1
+        
+            if mod(s,jump) == 0
+    
+                %---------------------------------------------------------%
+                % Patch: reorder equations
+                
+                % Reorder betas
+                beta_tmp3 = [];
+                for i = 1:p
+                    beta_tmp2 = NaN(N,N);
+                    beta_tmp1 = beta((i-1)*N+1:i*N,:);
+                    beta_tmp2(lEq1,:) = beta_tmp1(lEq2,:);
+                    beta_tmp2(~lEq1,:) = beta_tmp1(~lEq2,:);
+                    beta_tmp3 = [beta_tmp3;beta_tmp2];
+                end
+                beta_tmp3 = [beta_tmp3;beta(N*p+1:N*p+m,:)];
+                
+                beta0 = NaN(size(beta));
+                beta0(:,lEq1) = beta_tmp3(:,lEq2);
+                beta0(:,~lEq1) = beta_tmp3(:,~lEq2);
+                
+                % Reorder residuals
+                eps_tmp = NaN(size(eps));
+                eps_tmp(:,lEq1) = eps(:,lEq2);
+                eps_tmp(:,~lEq1) = eps(:,~lEq2);
+                eps0 = eps_tmp;
+
+                % Reorder sigmas
+                sigma0 = nan(size(sigma));
+                sigma0(lEq1,lEq1) = sigma(lEq2,lEq2);
+                sigma0(~lEq1,~lEq1) = sigma(~lEq2,~lEq2);
+                sigma0(lEq1,~lEq1) = sigma(lEq2,~lEq2);
+                sigma0(~lEq1,lEq1) = sigma(~lEq2,lEq2);
+
+                % Pack
+                in.betas  = beta0;
+                in.sigmas = sigma0;
+                in.es     = eps0;
+
+
+                %---------------------------------------------------------%
+                % Estimate impact matrix
+                in.betas  = beta0;
+                in.sigmas = sigma0;
+                in.es     = eps0;
+                [B0nnr_,IDX,flag] = SSAidentification(in,data,dims,modelOpt,dataOpt);
+        
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    % Transform to compact forecast notation
+                    [b,M] = compactForecastNotation(B0nnr_,beta0,data,dims);
+                    
+                    % Draw Y | B,S,Q
+                    SSA = DrawConditionalForecast_irf(b,M,SSArest,iImpulse,dims);
+            
+                    if SSA.KLc <= KLtresh
+            
+                        y_cf(:,:,k)      = SSA.y_cf;
+                        y_bl(:,:,k)      = SSA.y_bl;
+                        SSAshocks(:,:,k) = SSA.shocks;
+                        KLc(k,1)         = SSA.KLc;
+                        B0nnr(:,:,k)     = IDX.B0nnr;
+                        B0(:,:,k)        = IDX.B0;
+                        shock(:,:,k)     = IDX.shock;
+                        betas(:,:,k)     = beta0;              %VAR coefficients
+                        sigmas(:,:,k)    = sigma0;
+                        es(:,:,k)        = eps0;               %residuals for structural identification
+        
+                        k = k+1;                               %update index for storage matrices
+                    end
+                end
+            end
+            
+            s = s+1;
+            
+        end
+    end
+    
+    % Display number of explosive draws
+    if ~dropExplosive
+    disp(['    Number of explosive draws: ' num2str(neig)])
+    end
+    disp(' ')
+        
+
+    %---------------------------------------------------------------------%
+    % SYSTEM-WIDE HOMOSCEDASTIC
+    elseif strcmp(caseTriangular,'SW') 
+        
+        % Containers
+        betas     = NaN(N*p+m,N,draws);
+        sigmas    = NaN(N,N,draws);
+        es        = NaN(T-p,N,draws);
+        y_cf      = nan(h+1,N,draws);
+        y_bl      = nan(h+1,N,draws);
+        B0nnr     = nan(N,N,draws);
+        B0        = nan(N,N,draws);
+        shock     = nan(T-p,numel(shockVar),draws);
+        SSAshocks = nan(h+1,N,draws);
+        KLc       = nan(draws,1);
+        maxeig    = nan(sim,1);
+        neig      = 0;
+    
+        k = 1;
+        w = 1;
+        s = 1;
+        
+        % Initialise sampler
+        XX = X'*X;
+        S0 = diag(hpVAR.SS2);
+        sigma = S0;
+    
+        while k <= draws
+    
+            % Display advancement
+            if k == 10*w
+                if exist('txt','var')
+                    fprintf(repmat('\b', 1, numel(txt)));
+                end
+                disp(' ')
+                txt = ['    Draws satisfying KL condition: ',num2str(k),'/',num2str(s),' (of ',num2str(draws),' required) [',datestr(datetime),']\n'];
+                fprintf(txt);
+                w = w+1;
+            end
+        
+            % Draw from the posterior of beta
+            stationary = 0;
+            while stationary==0
+                
+                invsigma = inv(sigma);
+                omegabar = inv(iV + kron(invsigma,XX));                 %posterior variance
+                betabar = omegabar*(iVb_prior + kron(invsigma,X')*Y(:) );   %posterior mean
+                
+                beta = betabar + chol(omegabar)'*randn(N*(N*p+m),1);
+                beta = reshape(beta,N*p+m,N);
+        
+                % Check maximum eigenvalue
+                A = NaN(N*p);                                   %create companion matrix
+                A(1:N,:) = beta(1:end-m,:)';
+                A(N+1:end,:) = [eye(N*(p-1)) zeros(N*(p-1),N)];
+                maxeig(s,1) = max(abs(eig(A)));
+                
+                if maxeig(s,1) > 1
+                    neig = neig+1;
+                end
+                
+                if (dropExplosive == 0 || maxeig(s,1) < 1)
+                    stationary = 1;
+                end
+            end
+            eps = Y - X*beta;
+        
+            % Prior shape for sigma
+            sigma0_tmp = (eps'*eps + S0);
+        
+            % Draw sigma from the posterior
+            CinvS  = chol(inv(sigma0_tmp));
+            Xg = randn(T-p+N+2,N)*CinvS;       % vec(Xg) ~ N(vec(0),kron(inv(sigma),I))
+            sigma = inv(Xg'*Xg);          % (Xg'Xg) ~ W(inv(sigma),T+N+2)
+    
+            % Burnin phase
+            if s <= burnin
+                s = s+1;
+            
+            % Outside burnin
+            else
+                
+                if mod(s,jump) == 0
+        
+                    %-----------------------------------------------------%
+                    % Patch: reorder equations
+                    
+                    % Reorder betas
+                    beta_tmp3 = [];
+                    for i = 1:p
+                        beta_tmp2 = NaN(N,N);
+                        beta_tmp1 = beta((i-1)*N+1:i*N,:);
+                        beta_tmp2(lEq1,:) = beta_tmp1(lEq2,:);
+                        beta_tmp2(~lEq1,:) = beta_tmp1(~lEq2,:);
+                        beta_tmp3 = [beta_tmp3;beta_tmp2];
+                    end
+                    beta_tmp3 = [beta_tmp3;beta(N*p+1:N*p+m,:)];
+                    
+                    beta0 = NaN(size(beta));
+                    beta0(:,lEq1) = beta_tmp3(:,lEq2);
+                    beta0(:,~lEq1) = beta_tmp3(:,~lEq2);
+                    
+                    % Reorder residuals
+                    eps_tmp = NaN(size(eps));
+                    eps_tmp(:,lEq1) = eps(:,lEq2);
+                    eps_tmp(:,~lEq1) = eps(:,~lEq2);
+                    eps0 = eps_tmp;
+    
+                    % Reorder sigmas
+                    sigma0 = nan(size(sigma));
+                    sigma0(lEq1,lEq1) = sigma(lEq2,lEq2);
+                    sigma0(~lEq1,~lEq1) = sigma(~lEq2,~lEq2);
+                    sigma0(lEq1,~lEq1) = sigma(lEq2,~lEq2);
+                    sigma0(~lEq1,lEq1) = sigma(~lEq2,lEq2);
+    
+                    % Pack
+                    in.betas  = beta0;
+                    in.sigmas = sigma0;
+                    in.es     = eps0;
+    
+
+                    %-----------------------------------------------------%
+                    % Estimate impact matrix
+                    [B0nnr_,IDX,flag] = SSAidentification(in,data,dims,modelOpt,dataOpt);
+            
+                    % Skip draw if the covariance from gram-schmidt fails
+                    if flag == 0
+
+                        % Transform to compact forecast notation
+                        [b,M] = compactForecastNotation(B0nnr_,beta0,data,dims);
+                        
+                        % Draw Y | B,S,Q
+                        SSA = DrawConditionalForecast_irf(b,M,SSArest,iImpulse,dims);
+                
+                        if SSA.KLc <= KLtresh
+                
+                            y_cf(:,:,k)      = SSA.y_cf;
+                            y_bl(:,:,k)      = SSA.y_bl;
+                            SSAshocks(:,:,k) = SSA.shocks;
+                            KLc(k,1)         = SSA.KLc;
+                            B0nnr(:,:,k)     = IDX.B0nnr;
+                            B0(:,:,k)        = IDX.B0;
+                            shock(:,:,k)     = IDX.shock;
+                            betas(:,:,k)     = beta0;              %VAR coefficients
+                            sigmas(:,:,k)    = sigma0;
+                            es(:,:,k)        = eps0;               %residuals for structural identification
+            
+                            k = k+1;                               %update index for storage matrices
+                        end
+                    end
+                end
+                
+                s = s+1;
+                
+            end
+        end
+    
+    % Display number of explosive draws
+    if ~dropExplosive
+    disp(['    Number of explosive draws: ' num2str(neig)])
+    end
+    disp(' ')
+    
+    end
+        
+
+    %---------------------------------------------------------------------%
+    % Patch: reorder equations
+    
+    betas_tmp3 = [];
+    for i = 1:p
+        betas_tmp2 = NaN(N,N,draws);
+        betas_tmp1 = betas((i-1)*N+1:i*N,:,:);
+        betas_tmp2(lEq1,:,:) = betas_tmp1(lEq2,:,:);
+        betas_tmp2(~lEq1,:,:) = betas_tmp1(~lEq2,:,:);
+        betas_tmp3 = [betas_tmp3;betas_tmp2];
+    end
+    betas_tmp3 = [betas_tmp3;betas(N*p+1:N*p+m,:,:)];
+    
+    betas0 = NaN(size(betas));
+    betas0(:,lEq1,:) = betas_tmp3(:,lEq2,:);
+    betas0(:,~lEq1,:) = betas_tmp3(:,~lEq2,:);
+    
+    eps = NaN(size(es));
+    eps(:,lEq1,:) = es(:,lEq2,:);
+    eps(:,~lEq1,:) = es(:,~lEq2,:);
+    es0 = eps;
+    
+    es = es0;
+    betas = betas0;
+
+
+end
+
+%-------------------------------------------------------------------------%
+% Get IRFs (renormalise IRFs according to shockSize)
+IRF_cf = squeeze(num2cell(zeros(h+1,draws,N,N), [1 2]));
+IRF_bl = squeeze(num2cell(zeros(h+1,draws,N,N), [1 2]));
+if check1sd
+    for i = 1:N
+        for s = 1:draws
+        IRF_cf{i,iImpulse}(:,s) = y_cf(:,i,s);
+        IRF_bl{i,iImpulse}(:,s) = y_bl(:,i,s);
+        end
+    end
+else
+    for i = 1:N
+        for s = 1:draws
+        IRF_cf{i,iImpulse}(:,s) = y_cf(:,i,s)./y_cf(1,iImpulse,s).*shockSize;
+        IRF_bl{i,iImpulse}(:,s) = y_bl(:,i,s)./y_bl(1,iImpulse,s).*shockSize;
+        end
+    end
+end
+
+% Generate credibility regions
+IRFulm_cf = IRFbands(IRF_cf,N,h);
+IRFulm_bl = IRFbands(IRF_bl,N,h);
+
+% Store in structure
+IRFulm.IRFulm_bl = IRFulm_bl;
+IRFulm.IRFulm_cf = IRFulm_cf;
+
+
+%-------------------------------------------------------------------------%
+% Plot charts
+%disp('--> Plotting scenarios...')
+
+% Save to folder SSA
+plotOpt.folder = [plotOpt.folder,'/SSA/'];
+
+switch whichPlot
+
+    case 'none'
+        
+        %do nothing
+
+    case 'all'        %plot all versions
+
+    % Varendo
+    chartName = [chartName0,'_varendo_overlaid'];
+    legNames = {'baseline','counterfactual'};
+    plotOpt.ylab = ylab0;
+    IRFdisplay_SSA(IRFulm,varendo,varendolong,impulse,legNames,'allSeries',plotOpt,chartName)
+    %IRFdisplay_stack(IRFstruc,varendo,varendolong,shockVar,legNames,'allSeries',plotOpt,chartName)
+    % Use IRFdisplay_stack if you want bands for the conditional IRFs too.
+
+    if plotIndividualChannels
+    IRFdisplay_single(IRFulm_bl,varendo,varendolong,impulse,[chartName0,'_varendo_bl'],'allSeries',plotOpt)
+    
+    cb90_ = plotOpt.cb90;
+    plotOpt.cb90 = 0;  %plot only 68% bands for conditional IRFs.
+    IRFdisplay_single(IRFulm_cf,varendo,varendolong,impulse,[chartName0,'_varendo_cf'],'allSeries',plotOpt)
+    plotOpt.cb90 = cb90_;
+    end
+
+    % Varplot
+    if ~strcmp(varplot,impulse)
+        varplot = [varplot,impulse];
+    end
+    iPlot = ismember(varendo,varplot);
+    IRFulm_plot.IRFulm_bl = IRFulm_bl(iPlot,iPlot);
+    IRFulm_plot.IRFulm_cf = IRFulm_cf(iPlot,iPlot);
+    varplot = varendo(iPlot);
+    longnames = varendolong(iPlot);
+    plotOpt.ylab = ylab0(iPlot);
+    chartName = [chartName0,'_varplot_overlaid'];
+    IRFdisplay_SSA(IRFulm_plot,varplot,longnames,impulse,legNames,'varplot',plotOpt,chartName)
+
+    % Non varplot variables
+    iPlot2 = ~iPlot;             %policy variable missing
+    posShock = ismember(varendo,impulse);
+    iPlot2(posShock) = 1;        %reincluding policy variable
+    IRFulm_plot.IRFulm_bl = IRFulm_bl(iPlot2,iPlot2);
+    IRFulm_plot.IRFulm_cf = IRFulm_cf(iPlot2,iPlot2);
+    nonvarplot = varendo(iPlot2);
+    longnames = varendolong(iPlot2);
+    plotOpt.ylab = ylab0(iPlot2);
+    chartName = [chartName0,'_nonvarplot_overlaid'];
+    IRFdisplay_SSA(IRFulm_plot,nonvarplot,longnames,impulse,legNames,'varplot',plotOpt,chartName)
+
+    case 'varendo'    %varendo only
+
+    chartName = [chartName0,'_varendo_overlaid'];
+    legNames = {'baseline','counterfactual'};
+    plotOpt.ylab = ylab0;
+    IRFdisplay_SSA(IRFulm,varendo,varendolong,impulse,legNames,'allSeries',plotOpt,chartName)
+    %IRFdisplay_stack(IRFstruc,varendo,varendolong,shockVar,legNames,'allSeries',plotOpt,chartName)
+    % Use IRFdisplay_stack if you want bands for the conditional IRFs too.
+
+    if plotIndividualChannels
+    IRFdisplay_single(IRFulm_bl,varendo,varendolong,impulse,[chartName0,'_varendo_bl'],'allSeries',plotOpt)
+    
+    cb90_ = plotOpt.cb90;
+    plotOpt.cb90 = 0;  %plot only 68% bands for conditional IRFs.
+    IRFdisplay_single(IRFulm_cf,varendo,varendolong,impulse,[chartName0,'_varendo_cf'],'allSeries',plotOpt)
+    plotOpt.cb90 = cb90_;
+    end
+
+    case 'varplot1'    %varplot only
+
+    % Varplot
+    if ~strcmp(varplot,impulse)
+        varplot = [varplot,impulse];
+    end
+    iPlot = ismember(varendo,varplot);
+    IRFulm_plot.IRFulm_bl = IRFulm_bl(iPlot,iPlot);
+    IRFulm_plot.IRFulm_cf = IRFulm_cf(iPlot,iPlot);
+    varplot = varendo(iPlot);
+    longnames = varendolong(iPlot);
+    plotOpt.ylab = ylab0(iPlot);
+    chartName = [chartName0,'_varplot_overlaid'];
+    legNames = {'baseline','counterfactual'};
+    IRFdisplay_SSA(IRFulm_plot,varplot,longnames,impulse,legNames,'varplot',plotOpt,chartName)
+    
+    if plotIndividualChannels
+    plotOpt.ylab = ylab0;
+    IRFdisplay_single(IRFulm_bl,varendo,varendolong,impulse,[chartName0,'_varendo_bl'],'allSeries',plotOpt)
+    
+    cb90_ = plotOpt.cb90;
+    plotOpt.cb90 = 0;  %plot only 68% bands for conditional IRFs.
+    IRFdisplay_single(IRFulm_cf,varendo,varendolong,impulse,[chartName0,'_varendo_cf'],'allSeries',plotOpt)
+    plotOpt.cb90 = cb90_;
+    end
+
+    case 'varplot2'    %varplot only
+
+    % Varplot
+    if ~strcmp(varplot,impulse)
+        varplot = [varplot,impulse];
+    end
+    iPlot = ismember(varendo,varplot);
+    IRFulm_plot.IRFulm_bl = IRFulm_bl(iPlot,iPlot);
+    IRFulm_plot.IRFulm_cf = IRFulm_cf(iPlot,iPlot);
+    varplot = varendo(iPlot);
+    longnames = varendolong(iPlot);
+    plotOpt.ylab = ylab0(iPlot);
+    chartName = [chartName0,'_varplot_overlaid'];
+    legNames = {'baseline','counterfactual'};
+    IRFdisplay_SSA(IRFulm_plot,varplot,longnames,impulse,legNames,'varplot',plotOpt,chartName)
+
+    % Non varplot variables
+    iPlot2 = ~iPlot;             %policy variable missing
+    posShock = ismember(varendo,impulse);
+    iPlot2(posShock) = 1;        %reincluding policy variable
+    IRFulm_plot.IRFulm_bl = IRFulm_bl(iPlot2,iPlot2);
+    IRFulm_plot.IRFulm_cf = IRFulm_cf(iPlot2,iPlot2);
+    nonvarplot = varendo(iPlot2);
+    longnames = varendolong(iPlot2);
+    plotOpt.ylab = ylab0(iPlot2);
+    chartName = [chartName0,'_nonvarplot_overlaid'];
+    IRFdisplay_SSA(IRFulm_plot,nonvarplot,longnames,impulse,legNames,'varplot',plotOpt,chartName)
+
+    if plotIndividualChannels
+    plotOpt.ylab = ylab0;
+    IRFdisplay_single(IRFulm_bl,varendo,varendolong,impulse,[chartName0,'_varendo_bl'],'allSeries',plotOpt)
+    
+    cb90_ = plotOpt.cb90;
+    plotOpt.cb90 = 0;  %plot only 68% bands for conditional IRFs.
+    IRFdisplay_single(IRFulm_cf,varendo,varendolong,impulse,[chartName0,'_varendo_cf'],'allSeries',plotOpt)
+    plotOpt.cb90 = cb90_;
+    end
+
+end
+
+% Plot distribution of the shocks vs. normal
+chartName = [chartName0,'_shockDistribution'];
+SSAplotDistribution(SSAshocks,plotHorizon,varendolong,chartName,plotOpt)
+
+%-------------------------------------------------------------------------%
+% Pack output
+out.betas         = betas;
+out.sigmas        = sigmas;
+out.es            = es;
+out.hpVAR         = hpVAR;
+out.maxeig        = maxeig;
+out.neig          = neig;
+out.B0nnr         = B0nnr;
+out.B0            = B0;
+out.shock         = shock;
+out.IRF_cf        = IRF_cf;
+out.IRF_bl        = IRF_bl;
+out.IRFulm_cf     = IRFulm_cf;
+out.IRFulm_bl     = IRFulm_bl;
+%out.IRFulm        = IRFulm;
+out.KLc           = KLc;
+out.shockSequence = SSAshocks;
+
+if strcmp(identification,'iv')
+    out.Fstat     = IDX.Fstat;
+    out.Frobust   = IDX.Frobust;
+end
+

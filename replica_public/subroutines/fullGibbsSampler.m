@@ -1,0 +1,578 @@
+function out = fullGibbsSampler(data,dims,hp,modelOpt,dataOpt,miscOpt)
+% Full Gibbs Sampler Algorithm for Bayesian VARs
+
+% INPUT:
+% - data     : output from makeXY;
+% - dims     : output from makeXY;
+% - hp       : hyperparameters and related options;
+% - modelOpt : structure containing model options;
+% - dataOpt  : structure containing data options; 
+% - miscOpt  : structure containing misc options;
+
+% OUTPUT:
+% - out      : structure containing estimation results and IRFs;
+
+% riccardo.degasperi@bancaditalia.it
+%-------------------------------------------------------------------------%
+
+% Unpacking
+X               = data.X;
+Y               = data.Y;
+endo            = data.endo;
+Xex             = data.Xex;
+T               = dims.T;
+N               = dims.N;
+p               = dims.p;
+pexo            = dims.pexo;
+m               = dims.m;
+mc              = dims.mc;
+h               = dims.h;
+dropExplosive   = miscOpt.dropExplosive;
+shutVar         = modelOpt.shutVar;
+shutEq          = modelOpt.shutEq;
+sim             = modelOpt.sim;
+burnin          = modelOpt.burnin;
+jump            = modelOpt.jump;
+identification  = modelOpt.identification;
+draws           = (sim-burnin)/jump;
+GLP             = hp.GLP;
+shockVar        = dataOpt.shockVar;
+shockSize       = dataOpt.shockSize;
+shockSign       = dataOpt.shockSign;
+varendo         = dataOpt.varendo;
+
+% Check whether the shock is normalised or one SD
+check1sd = strcmp('1sd',shockSize);
+
+
+%-------------------------------------------------------------------------%
+% Estimate univariate AR(order) for each endogenous variable
+hp.SS  = NaN(N,1);         %container for residual standard deviations
+hp.SS2 = NaN(N,1);         %container for residual variances
+order  = 1;                %we fit an AR(order) for the whole sample T
+
+for i = 1:N
+
+    % Build X and Y matrices
+    X2  = [ones(T-order,1) lagX(endo(:,i),order)]; % (T-p)x(p+1) matrix (with constant)
+    Y2  = endo(order+1:end,i);                     % (T-p)x1 matrix
+    
+    % Intermediate step
+    XX2 = X2'*X2;
+    XY2 = X2'*Y2;
+
+    % Compute beta and std of residuals
+    b2         = XX2\XY2;
+    hp.e2(:,i) = Y2-X2*b2;
+    hp.SS(i)   = std(Y2-X2*b2);
+    hp.SS2(i)  = hp.SS(i).^2;
+end
+
+% Compute mean across first p observations for endogenous
+Ybar = mean(endo(1:p,:),1)';
+
+% Compute mean across first p observations for exogenous
+if ~isempty(Xex)
+    Xbar = mean(Xex(1:p-pexo,:),1);
+else
+    Xbar = [];
+end
+
+%-------------------------------------------------------------------------%
+if modelOpt.dummies
+
+    
+    % Optimal priors
+    hpVAR = hp;   %initialise hpVAR
+    
+    if GLP
+    %disp('--> Computing optimal priors...')
+        
+        [hpglp,csmin,postMode] = GLPoptimalPriors(Y,X,Ybar,Xbar,hp,dims);
+    
+        % Update hyperparameters
+        f     = fieldnames(hpglp);
+        for i = 1:length(f)
+            hpVAR.(f{i}) = hpglp.(f{i});
+        end
+    
+    end
+    
+    % Generate dummy observations
+    [Yd,Xd] = dummyObs(Ybar,Xbar,hpVAR,dims);
+    
+    % Combined X and Y matrices
+    Yd = [Y; Yd];
+    Xd = [X; Xd];
+    
+    % Estimate reduced-form VAR
+    beta0    = Xd\Yd;
+    e0      = Yd-Xd*beta0;            %including dummies
+    [TT,NN] = size(Xd);
+    d       = N+2;
+    sigma0   = (e0'*e0)/(TT-NN+d+1);  %same Dof correction as GLP
+    
+    %---------------------------------------------------------------------%
+    % Sampler
+    
+    % Initialise containers
+    betas     = nan(N*p+m+mc,N,draws);
+    sigmas    = nan(N,N,draws);
+    es        = nan(T-p,N,draws);
+    B0nnr     = nan(N,N,draws);
+    B0        = nan(N,N,draws);
+    % Fdistr    = nan(draws,Niv);
+    % Frdistr   = nan(draws,Niv);
+    shock     = nan(T-p,numel(shockVar),draws);
+    maxeig    = nan(sim,1);
+    neig      = 0;
+    
+    k = 1;                                          %initialise index for storage matrices
+    s = 1;                                          %initialise count
+    w = 1;                                          %initialise count
+    
+    CinvS  = chol(inv((TT-NN+d+1)*nspd(sigma0)));   %removing DoF correction from sigma
+    CinvXX = chol(inv(Xd'*Xd));
+    
+    while k <= draws
+
+        % Display advancement
+        if k == 10*w
+            if exist('txt','var')
+                fprintf(repmat('\b', 1, numel(txt)));
+            end
+            disp(' ')
+            txt = ['    Accepted draws: ',num2str(k),'/',num2str(s),' (of ',num2str(draws),' required) [',datestr(datetime),']\n'];
+            fprintf(txt);
+            w = w+1;
+        end
+    
+        %Get Psi
+        Xg = randn(TT+2-(N*p+m+mc),N)*CinvS;           % vec(Xg) ~ N(vec(0),kron(inv(TT*sigma),I))
+        sigma = inv(Xg'*Xg);                        % (Xg'Xg) ~ W(inv(TT*sigma),TT+2-(N*p+1))
+        % NOTE: Dof same as Banbura, Giannone & Reichlin (2010).
+        %       TT+2-(N*p+m) = T+N+2 (= df in GLP)
+        
+        %Get Cholesky factor to use in MN below
+        Csigmas = chol(sigma);
+    
+        %Draw from posterior of beta (matrixvariate)
+        tmp  = randn(size(beta0));
+        beta = beta0 + CinvXX'*tmp*Csigmas;         % vec(betag) ~ N(vec(beta),kron(Sg,invXX))
+        
+        % Check maximum eigenvalue
+        A = NaN(N*p);                               %create companion matrix
+        A(1:N,:) = beta(1:end-m-mc,:)';
+        A(N+1:end,:) = [eye(N*(p-1)) zeros(N*(p-1),N)];
+        maxeig(s,1) = max(abs(eig(A)));             %compute maximum eigenvalue
+        if maxeig(s,1) > 1
+            neig = neig+1;
+        end
+    
+        % Get residuals
+        eps = Y - X*beta;
+    
+        % Burnin phase
+        if s <= burnin
+            s = s+1;
+        
+        % If we keep explosive draws
+        elseif ~dropExplosive && s > burnin
+            
+            if mod(s,jump) == 0
+    
+                % Estimate impact matrix
+                in.betas   = beta;
+                in.sigmas  = sigma;
+                in.es      = eps;
+                [IDX,flag] = fullGibbsIdentification(in,data,dims,modelOpt,dataOpt);
+
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    B0nnr(:,:,k)     = IDX.B0nnr;
+                    B0(:,:,k)        = IDX.B0;
+                    shock(:,:,k)     = IDX.shock;
+                    betas(:,:,k)     = beta;               %VAR coefficients
+                    sigmas(:,:,k)    = sigma; 
+                    es(:,:,k)        = Y - X*beta;         %residuals for structural identification
+                    Fdistr(k,:)      = IDX.Fdistr(:,1)';
+                    Frdistr(k,:)     = IDX.Frdistr(:,1)';
+                    RMdistr(k,:)     = IDX.RMdistr(:,1)';
+    
+                    k = k+1;                               %update index for storage matrices
+                end
+            end
+            
+            s = s+1;
+    
+        % If we discard explosive draws
+        elseif dropExplosive && s > burnin && maxeig(s,1) < 1
+        
+            if mod(s,jump) == 0
+    
+                % Estimate impact matrix
+                in.betas   = beta;
+                in.sigmas  = sigma;
+                in.es      = eps;
+                [IDX,flag] = fullGibbsIdentification(in,data,dims,modelOpt,dataOpt);
+        
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    B0nnr(:,:,k)     = IDX.B0nnr;
+                    B0(:,:,k)        = IDX.B0;
+                    shock(:,:,k)     = IDX.shock;
+                    betas(:,:,k)     = beta;               %VAR coefficients
+                    sigmas(:,:,k)    = sigma; 
+                    es(:,:,k)        = Y - X*beta;         %residuals for structural identification
+                    Fdistr(k,:)      = IDX.Fdistr(:,1)';
+                    Frdistr(k,:)     = IDX.Frdistr(:,1)';
+                    RMdistr(k,:)     = IDX.RMdistr(:,1)';
+    
+                    k = k+1;                               %update index for storage matrices
+                end
+            end
+            
+            s = s+1;
+            
+        end
+    end
+    
+    % Display number of explosive draws
+    if ~dropExplosive
+    disp(['    Number of explosive draws: ' num2str(neig)])
+    end
+    disp(' ')
+
+
+%-------------------------------------------------------------------------%
+elseif modelOpt.triangular
+
+    % Patch: reorder equations moving shutEq on top
+    % NOTE: this is necessary to cast priors that are not block-diagonal.
+    
+    %Find location of equations to shut
+    lEq1 = ismember(varendo,shutEq);               %for reordering
+    lEq2 = false(1,N);  lEq2(1:sum(lEq1)) = true;  %to go back to previous order
+    
+    %Reorder X and Y
+    Y = [Y(:,lEq1) Y(:,~lEq1)];
+    
+    for i = 1:p
+        X_tmp = X(:,(i-1)*N+1:i*N);
+        X(:,(i-1)*N+1:i*N) = [X_tmp(:,lEq1) X_tmp(:,~lEq1)];
+    end
+    
+    % Reorder position of coefficients to shrink
+    lCoef = ismember(varendo,shutVar);
+    lCoef = [lCoef(lEq1) lCoef(~lEq1)];
+
+    % Initialise hpVAR
+    hpVAR = hp;
+    
+    % Reorder other relevant items
+    hpVAR.iRW = [hpVAR.iRW(lEq1);hpVAR.iRW(~lEq1)];
+    hpVAR.SS  = [hpVAR.SS(lEq1);hpVAR.SS(~lEq1)];
+    hpVAR.SS2 = [hpVAR.SS2(lEq1);hpVAR.SS2(~lEq1)];
+    hpVAR.e2  = [hpVAR.e2(:,lEq1) hpVAR.e2(:,~lEq1)];
+    
+    % Update positions for casting dogmatic prior
+    hpVAR.iParam = find(lCoef);                         %variables to shrink to zero
+    hpVAR.iEq    = 1:sum(lEq1);                         %equations to shrink
+
+
+    %---------------------------------------------------------------------%
+    % EQUATION-BY-EQUATION HOMOSCEDASTIC Chan
+
+    % Optimal priors
+    if GLP
+    [ml_opt,hpVAR] = get_OptKappa_mod(Y,X,p,m,hpVAR);
+    end
+
+    sim0 = 1;         %one draw at the time
+    
+    % Containers
+    Beta = zeros(sim0,N*(N*p+m));
+    Alp  = zeros(sim0,N*(N-1)/2);
+    Sig  = zeros(sim0,N);
+
+    betas     = nan(N*p+m,N,draws);
+    sigmas    = nan(N,N,draws);
+    es        = nan(T-p,N,draws);
+    B0nnr     = nan(N,N,draws);
+    B0        = nan(N,N,draws);
+    % Fdistr    = nan(draws,Niv);
+    % Frdistr   = nan(draws,Niv);
+    % RMdistr   = nan(draws,Niv);
+    shock     = nan(T-p,numel(shockVar),draws);
+    maxeig    = nan(sim,1);
+    neig      = 0;
+
+    k = 1;                                          %initialise index for storage matrices
+    s = 1;                                          %initialise count
+    w = 1;                                          %initialise count
+    while k <= draws
+
+        % Display advancement
+        if k == 10*w
+            if exist('txt','var')
+                fprintf(repmat('\b', 1, numel(txt)));
+            end
+            disp(' ')
+            txt = ['    Accepted draws: ',num2str(k),'/',num2str(s),' (of ',num2str(draws),' required) [',datestr(datetime),']\n'];
+            fprintf(txt);
+            w = w+1;
+        end
+    
+        % Equation-by-equation
+        count_alp = 0;
+        for ii = 1:N
+            
+            yi = Y(:,ii);
+            ki = N*p+ii +m-1;
+            
+            [mi,Vi,nui,Si,~] = prior_ACPi_mod(N,p,m,ii,hpVAR);
+            Xi = [X -Y(:,1:ii-1)];                                                      %adding -Y to the regressors (we are in structural form)
+            
+            % compute the parameters of the posterior distribution
+            iVi = Vi\speye(ki);
+            Kthetai = iVi + Xi'*Xi;
+            CKthetai = chol(Kthetai,'lower');    
+            thetai_hat = (CKthetai')\(CKthetai\(iVi*mi + Xi'*yi));                      %sigma is not there in Xi'yi because Sigma = eye(N) in structural form
+            Si_hat = Si + (yi'*yi + mi'*iVi*mi - thetai_hat'*Kthetai*thetai_hat)/2;
+            
+            % sample sig and theta
+            Sigi = 1./gamrnd(nui+(T-p)/2,1./Si_hat,sim0,1);
+            U = randn(sim0,ki).*repmat(sqrt(Sigi),1,ki);
+            Thetai = repmat(thetai_hat',sim0,1) + U/CKthetai;
+            
+            Sig(:,ii) = Sigi;
+            Beta(:,(ii-1)*(N*p+m)+1:ii*(N*p+m)) =  Thetai(:,1:N*p+m);
+            Alp(:,count_alp+1:count_alp+ii-1) =  Thetai(:,N*p+m+1:end);                  %estimates of the free elements in A
+            count_alp = count_alp + ii -1;
+        end
+
+        store_alp  = Alp;
+        store_beta = Beta;
+        store_Sig  = Sig;
+        
+        [store_Btilde,store_Sigtilde] = getReducedForm(store_alp,store_beta,store_Sig);
+        
+        beta_tmp = permute(store_Btilde,[2,1]);
+        beta = reshape(beta_tmp,N*p+m,N);
+        sigma = permute(store_Sigtilde,[2,3,1]);
+        eps = Y - X*beta;
+
+        % Check maximum eigenvalue
+        A = NaN(N*p);                               %create companion matrix
+        A(1:N,:) = beta(1:end-m,:)';
+        A(N+1:end,:) = [eye(N*(p-1)) zeros(N*(p-1),N)];
+        maxeig(s,1) = max(abs(eig(A)));             %compute maximum eigenvalue
+        if maxeig(s,1) > 1
+            neig = neig+1;
+        end
+
+        % Burnin phase
+        if s <= burnin
+            s = s+1;
+        
+        % If we keep explosive draws
+        elseif ~dropExplosive && s > burnin
+            
+            if mod(s,jump) == 0
+    
+                %---------------------------------------------------------%
+                % Patch: reorder equations
+                
+                % Reorder betas
+                beta_tmp3 = [];
+                for i = 1:p
+                    beta_tmp2 = NaN(N,N);
+                    beta_tmp1 = beta((i-1)*N+1:i*N,:);
+                    beta_tmp2(lEq1,:) = beta_tmp1(lEq2,:);
+                    beta_tmp2(~lEq1,:) = beta_tmp1(~lEq2,:);
+                    beta_tmp3 = [beta_tmp3;beta_tmp2];
+                end
+                beta_tmp3 = [beta_tmp3;beta(N*p+1:N*p+m,:)];
+                
+                beta0 = NaN(size(beta));
+                beta0(:,lEq1) = beta_tmp3(:,lEq2);
+                beta0(:,~lEq1) = beta_tmp3(:,~lEq2);
+                
+                % Reorder residuals
+                eps_tmp = NaN(size(eps));
+                eps_tmp(:,lEq1) = eps(:,lEq2);
+                eps_tmp(:,~lEq1) = eps(:,~lEq2);
+                eps0 = eps_tmp;
+
+                % Reorder sigmas
+                sigma0 = nan(size(sigma));
+                sigma0(lEq1,lEq1) = sigma(lEq2,lEq2);
+                sigma0(~lEq1,~lEq1) = sigma(~lEq2,~lEq2);
+                sigma0(lEq1,~lEq1) = sigma(lEq2,~lEq2);
+                sigma0(~lEq1,lEq1) = sigma(~lEq2,lEq2);
+
+                % Pack
+                in.betas  = beta0;
+                in.sigmas = sigma0;
+                in.es     = eps0;
+
+
+                %---------------------------------------------------------%
+                % Estimate impact matrix
+                [IDX,flag] = fullGibbsIdentification(in,data,dims,modelOpt,dataOpt);
+        
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    B0nnr(:,:,k)     = IDX.B0nnr;
+                    B0(:,:,k)        = IDX.B0;
+                    shock(:,:,k)     = IDX.shock;
+                    betas(:,:,k)     = beta0;              %VAR coefficients
+                    sigmas(:,:,k)    = sigma0;
+                    es(:,:,k)        = eps0;               %residuals for structural identification
+                    Fdistr(k,:)      = IDX.Fdistr(:,1)';
+                    Frdistr(k,:)     = IDX.Frdistr(:,1)';
+                    RMdistr(k,:)     = IDX.RMdistr(:,1)';
+
+                    k = k+1;                               %update index for storage matrices
+                end
+            end
+            
+            s = s+1;
+    
+        % If we discard explosive draws
+        elseif dropExplosive && s > burnin && maxeig(s,1) < 1
+        
+            if mod(s,jump) == 0
+    
+                %---------------------------------------------------------%
+                % Patch: reorder equations
+                
+                % Reorder betas
+                beta_tmp3 = [];
+                for i = 1:p
+                    beta_tmp2 = NaN(N,N);
+                    beta_tmp1 = beta((i-1)*N+1:i*N,:);
+                    beta_tmp2(lEq1,:) = beta_tmp1(lEq2,:);
+                    beta_tmp2(~lEq1,:) = beta_tmp1(~lEq2,:);
+                    beta_tmp3 = [beta_tmp3;beta_tmp2];
+                end
+                beta_tmp3 = [beta_tmp3;beta(N*p+1:N*p+m,:)];
+                
+                beta0 = NaN(size(beta));
+                beta0(:,lEq1) = beta_tmp3(:,lEq2);
+                beta0(:,~lEq1) = beta_tmp3(:,~lEq2);
+                
+                % Reorder residuals
+                eps_tmp = NaN(size(eps));
+                eps_tmp(:,lEq1) = eps(:,lEq2);
+                eps_tmp(:,~lEq1) = eps(:,~lEq2);
+                eps0 = eps_tmp;
+
+                % Reorder sigmas
+                sigma0 = nan(size(sigma));
+                sigma0(lEq1,lEq1) = sigma(lEq2,lEq2);
+                sigma0(~lEq1,~lEq1) = sigma(~lEq2,~lEq2);
+                sigma0(lEq1,~lEq1) = sigma(lEq2,~lEq2);
+                sigma0(~lEq1,lEq1) = sigma(~lEq2,lEq2);
+
+                % Pack
+                in.betas  = beta0;
+                in.sigmas = sigma0;
+                in.es     = eps0;
+
+
+                %---------------------------------------------------------%
+                % Estimate impact matrix
+                in.betas  = beta0;
+                in.sigmas = sigma0;
+                in.es     = eps0;
+                [IDX,flag] = fullGibbsIdentification(in,data,dims,modelOpt,dataOpt);
+        
+                % Skip draw if the covariance from gram-schmidt fails
+                if flag == 0
+
+                    B0nnr(:,:,k)     = IDX.B0nnr;
+                    B0(:,:,k)        = IDX.B0;
+                    shock(:,:,k)     = IDX.shock;
+                    betas(:,:,k)     = beta0;              %VAR coefficients
+                    sigmas(:,:,k)    = sigma0;
+                    es(:,:,k)        = eps0;               %residuals for structural identification
+                    Fdistr(k,:)      = IDX.Fdistr(:,1)';
+                    Frdistr(k,:)     = IDX.Frdistr(:,1)';
+                    RMdistr(k,:)     = IDX.RMdistr(:,1)';
+
+                    k = k+1;                               %update index for storage matrices
+                end
+            end
+            
+            s = s+1;
+            
+        end
+    end
+    
+    % Display number of explosive draws
+    if ~dropExplosive
+    disp(['    Number of explosive draws: ' num2str(neig)])
+    end
+    disp(' ')
+
+end
+
+%-------------------------------------------------------------------------%
+% Generate Structural-form Impulse Response Functions
+disp('--> Generating structural-form IRFs...')
+
+% If shockSize = '1sd', use non-normalised impact matrix to generate IRFs
+if check1sd
+    B0_ = B0nnr;
+else
+    B0_ = B0;
+end
+
+% Generate structural impulse responses
+if miscOpt.FEVD
+    IRF = IRFbuild(betas,dims,shockSign);
+else
+    IRF = []; %unused
+end
+IRFs = IRFsbuild(betas,IRF,B0_,dims,shockSign);
+
+
+%-------------------------------------------------------------------------%
+% Get IRFs median, upper and lower bounds
+IRFsulm = IRFbands(IRFs,N,h);
+
+
+%-------------------------------------------------------------------------%
+% Get distributions of relevance measures
+Fdistr_ = [quantile(Fdistr,0.05,1)' quantile(Fdistr,0.5,1)' quantile(Fdistr,0.95,1)'];
+Frdistr_ = [quantile(Frdistr,0.05,1)' quantile(Frdistr,0.5,1)' quantile(Frdistr,0.95,1)'];
+RMdistr_ = [quantile(RMdistr,0.05,1)' quantile(RMdistr,0.5,1)' quantile(RMdistr,0.95,1)']; 
+
+
+%-------------------------------------------------------------------------%
+% Pack output
+out.betas         = betas;
+out.sigmas        = sigmas;
+out.es            = es;
+out.hpVAR         = hpVAR;
+out.maxeig        = maxeig;
+out.neig          = neig;
+out.B0nnr         = B0nnr;
+out.B0            = B0;
+out.shock         = shock;
+out.IRF           = IRF;
+out.IRFs          = IRFs;
+out.IRFsulm       = IRFsulm;
+
+if strcmp(identification,'iv')
+    out.Fstat     = IDX.Fstat;
+    out.Frobust   = IDX.Frobust;
+    out.Fdistr    = Fdistr_;
+    out.Frdistr   = Frdistr_;
+    out.RMdistr   = RMdistr_;
+end
+
